@@ -28,13 +28,13 @@ export function extractTaskComplete(ev) {
 
 /**
  * Spawn `codex exec` (or `codex exec resume`) and yield NDJSON events.
- * Callers consume events from `onEvent`; resolve `done` when the process exits.
- *
- * Windows note: npm global installs provide `codex.cmd` (not `codex.exe`).
- * Node spawn without shell:true cannot resolve .cmd extensions on Windows.
- * To avoid shell-injection risk from user prompt (passed as a positional arg),
- * we do NOT use shell:true. Instead we auto-suffix `.cmd` on Windows when the
- * bare binary name `codex` is passed — resolves correctly via PATH.
+ * The user's prompt is piped via stdin (codex's `-` argument) rather than
+ * passed as a positional argument. This is required because:
+ *   1) On Windows (Node 18.20+/CVE-2024-27980), `spawn('codex.cmd', ...)` without
+ *      `shell:true` fails with EINVAL.
+ *   2) With `shell:true`, passing user input as an arg would risk shell injection.
+ * Piping prompt via stdin keeps `shell:true` safe — only config-controlled args
+ * (workspaceDir, sandbox, approval, sessionId from codex itself) reach the shell.
  *
  * @param {object} opts
  * @param {string} opts.binary - 'codex'
@@ -42,15 +42,12 @@ export function extractTaskComplete(ev) {
  * @param {string} opts.sandbox - 'workspace-write'
  * @param {string} opts.approval - 'never'
  * @param {string|null} opts.sessionId - resume id, or null for fresh
- * @param {string} opts.prompt - user message
+ * @param {string} opts.prompt - user message (piped to stdin)
  * @param {number} opts.timeoutMs
  * @param {(ev:object)=>void} opts.onEvent
  * @returns {Promise<{exitCode:number, signal:string|null, stderr:string}>}
  */
 export function runCodex(opts) {
-  // On Windows, npm global bin exposes codex.cmd, not codex.exe.
-  // Using shell:true would allow shell-injection from opts.prompt, so we
-  // instead resolve the .cmd extension explicitly on Windows.
   const isWin = process.platform === 'win32';
   const binary = isWin && opts.binary === 'codex' ? 'codex.cmd' : opts.binary;
 
@@ -61,11 +58,11 @@ export function runCodex(opts) {
     '--cd', opts.workspaceDir,
     '--sandbox', opts.sandbox,
     '--ask-for-approval', opts.approval,
-    '--', opts.prompt
+    '-'  // read prompt from stdin
   );
 
   return new Promise((resolve, reject) => {
-    const child = spawn(binary, args, { windowsHide: true });
+    const child = spawn(binary, args, { windowsHide: true, shell: isWin });
     let stderr = '';
     let stdoutBuf = '';
     let killed = false;
@@ -99,12 +96,15 @@ export function runCodex(opts) {
 
     child.on('close', (exitCode, signal) => {
       clearTimeout(timer);
-      // flush any remaining buffer
       if (stdoutBuf.trim()) {
         const ev = parseEventLine(stdoutBuf);
         if (ev) { try { opts.onEvent(ev); } catch {} }
       }
       resolve({ exitCode: killed ? -1 : exitCode, signal, stderr });
     });
+
+    child.stdin.setDefaultEncoding('utf8');
+    child.stdin.write(opts.prompt);
+    child.stdin.end();
   });
 }
