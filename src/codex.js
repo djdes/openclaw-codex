@@ -9,21 +9,31 @@ export function parseEventLine(line) {
 
 export function extractTextDelta(ev) {
   if (!ev || typeof ev !== 'object') return null;
-  if (ev.type !== 'agent_message_delta' && ev.type !== 'text_delta' && ev.type !== 'message_delta') return null;
-  if (typeof ev.delta === 'string') return ev.delta;
-  if (ev.item && typeof ev.item.text === 'string') return ev.item.text;
+  // Codex 0.125: final reply lands as item.completed with item.type=agent_message
+  if (ev.type === 'item.completed' && ev.item?.type === 'agent_message' && typeof ev.item.text === 'string') {
+    return ev.item.text;
+  }
+  // Hypothetical future streaming variants (kept for forward compatibility)
+  if (ev.type === 'agent_message_delta' || ev.type === 'text_delta' || ev.type === 'message_delta') {
+    if (typeof ev.delta === 'string') return ev.delta;
+    if (ev.item && typeof ev.item.text === 'string') return ev.item.text;
+  }
   return null;
 }
 
 export function extractSessionId(ev) {
   if (!ev || typeof ev !== 'object') return null;
+  // Codex 0.125: session id arrives as thread.started/thread_id
+  if (ev.type === 'thread.started' && ev.thread_id) return ev.thread_id;
+  // Older naming, kept defensive
   if (ev.session_id) return ev.session_id;
   if (ev.sessionId) return ev.sessionId;
+  if (ev.thread_id) return ev.thread_id;
   return null;
 }
 
 export function extractTaskComplete(ev) {
-  return ev?.type === 'task_complete' || ev?.type === 'turn_complete';
+  return ev?.type === 'turn.completed' || ev?.type === 'task_complete' || ev?.type === 'turn_complete';
 }
 
 /**
@@ -51,13 +61,19 @@ export function runCodex(opts) {
   const isWin = process.platform === 'win32';
   const binary = isWin && opts.binary === 'codex' ? 'codex.cmd' : opts.binary;
 
+  // Codex 0.125 exec mode: `--full-auto` is a convenience for sandboxed
+  // automatic execution (workspace-write + no approval prompts). The older
+  // `--ask-for-approval` flag does not exist on `exec`. We keep `opts.sandbox`
+  // and `opts.approval` in the config schema for forward compatibility but
+  // they are not currently passed to the CLI.
+  // Codex 0.125 resume syntax: `codex exec resume <SESSION_ID> [PROMPT]`
+  // Session id is positional, NOT a --session-id flag.
   const args = ['exec'];
-  if (opts.sessionId) args.push('resume', '--session-id', opts.sessionId);
+  if (opts.sessionId) args.push('resume', opts.sessionId);
   args.push(
     '--json',
     '--cd', opts.workspaceDir,
-    '--sandbox', opts.sandbox,
-    '--ask-for-approval', opts.approval,
+    '--full-auto',
     '-'  // read prompt from stdin
   );
 

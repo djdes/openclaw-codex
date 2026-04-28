@@ -31,6 +31,16 @@ test('extractTextDelta: returns null for non-delta event', () => {
   assert.equal(extractTextDelta({ type: 'tool_call_begin' }), null);
 });
 
+test('extractTextDelta: returns text from codex 0.125 item.completed agent_message', () => {
+  const ev = { type: 'item.completed', item: { id: 'item_6', type: 'agent_message', text: 'pong' } };
+  assert.equal(extractTextDelta(ev), 'pong');
+});
+
+test('extractTextDelta: returns null for item.completed of non-agent_message type', () => {
+  const ev = { type: 'item.completed', item: { id: 'item_0', type: 'command_execution', exit_code: 0 } };
+  assert.equal(extractTextDelta(ev), null);
+});
+
 test('extractSessionId: extracts from session_started event', () => {
   assert.equal(extractSessionId({ type: 'session_started', session_id: 'abc-123' }), 'abc-123');
 });
@@ -43,8 +53,17 @@ test('extractSessionId: returns null when not present', () => {
   assert.equal(extractSessionId({ type: 'agent_message_delta' }), null);
 });
 
+test('extractSessionId: extracts from codex 0.125 thread.started event', () => {
+  const ev = { type: 'thread.started', thread_id: '019dd3b0-5a1e-7d70-929d-2e13345879d0' };
+  assert.equal(extractSessionId(ev), '019dd3b0-5a1e-7d70-929d-2e13345879d0');
+});
+
 test('extractTaskComplete: returns true for task_complete', () => {
   assert.equal(extractTaskComplete({ type: 'task_complete' }), true);
+});
+
+test('extractTaskComplete: returns true for codex 0.125 turn.completed', () => {
+  assert.equal(extractTaskComplete({ type: 'turn.completed', usage: { input_tokens: 100 } }), true);
 });
 
 test('extractTaskComplete: returns false for other types', () => {
