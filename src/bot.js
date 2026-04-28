@@ -1,7 +1,7 @@
 import { Bot } from 'grammy';
 import { runCodex, extractTextDelta, extractSessionId, extractTaskComplete } from './codex.js';
 
-const HELP_TEXT = `Codex-powered Klauod bridge.
+const HELP_TEXT = `Codex-powered Клауд bridge.
 
 Команды:
 /reset — забыть текущую сессию (новый контекст с следующего сообщения)
