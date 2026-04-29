@@ -66,16 +66,17 @@ export function runCodex(opts) {
   // `--ask-for-approval` flag does not exist on `exec`. We keep `opts.sandbox`
   // and `opts.approval` in the config schema for forward compatibility but
   // they are not currently passed to the CLI.
-  // Codex 0.125 resume syntax: `codex exec resume <SESSION_ID> [PROMPT]`
-  // Session id is positional, NOT a --session-id flag.
+  // Codex 0.125 syntax differs between fresh exec and resume:
+  //   fresh:  codex exec --json --cd <dir> --full-auto -
+  //   resume: codex exec resume --json <SESSION_ID> --full-auto -
+  // Resume does NOT accept --cd (inherits workspace from the original session).
+  // Session id is positional after `resume`.
   const args = ['exec'];
-  if (opts.sessionId) args.push('resume', opts.sessionId);
-  args.push(
-    '--json',
-    '--cd', opts.workspaceDir,
-    '--full-auto',
-    '-'  // read prompt from stdin
-  );
+  if (opts.sessionId) {
+    args.push('resume', '--json', opts.sessionId, '--full-auto', '-');
+  } else {
+    args.push('--json', '--cd', opts.workspaceDir, '--full-auto', '-');
+  }
 
   return new Promise((resolve, reject) => {
     const child = spawn(binary, args, { windowsHide: true, shell: isWin });
