@@ -1,18 +1,15 @@
 import { Bot } from 'grammy';
-import { writeFileSync, mkdirSync, unlinkSync } from 'node:fs';
-import { tmpdir } from 'node:os';
-import { join } from 'node:path';
 import { runCodex, extractTextDelta, extractSessionId, extractTaskComplete } from './codex.js';
-
-const IMAGE_TMP_DIR = join(tmpdir(), 'openclaw-codex-images');
-const IMAGE_CLEANUP_MS = 5 * 60 * 1000;
+import { downloadAttachment, scheduleCleanup, reactSafe } from './attachments.js';
 
 const HELP_TEXT = `Codex-powered Клауд bridge.
 
 Команды:
 /reset — забыть текущую сессию (новый контекст с следующего сообщения)
 /status — статус процесса
-/whoami — кратко представиться`;
+/whoami — кратко представиться
+
+Поддерживаемые вложения: фото, документы (PDF/DOCX/TXT/CSV/JSON/любые), голосовые, аудио, видео, видеосообщения. Файл скачивается и Codex читает его инструментами в workspace.`;
 
 export function createBot({ config, sessions, queue, log }) {
   const bot = new Bot(config.telegram.botToken);
@@ -53,39 +50,144 @@ export function createBot({ config, sessions, queue, log }) {
 
   bot.command('whoami', async (ctx) => {
     if (!isAllowed(ctx)) return;
+    await reactSafe(ctx, '👀');
     await handleMessage(ctx, 'Представься коротко в одну строку.');
   });
 
   bot.on('message:text', async (ctx) => {
     if (!isAllowed(ctx)) return;
-    if (ctx.message.text.startsWith('/')) return; // commands handled above
+    if (ctx.message.text.startsWith('/')) return;
+    await reactSafe(ctx, '👀');
     await handleMessage(ctx, ctx.message.text);
   });
 
   bot.on('message:photo', async (ctx) => {
     if (!isAllowed(ctx)) return;
+    await reactSafe(ctx, '👀');
     const photos = ctx.message.photo;
     const largest = photos[photos.length - 1];
     const caption = ctx.message.caption || 'Что на изображении? Опиши кратко.';
-
-    let tempPath;
+    let path;
     try {
-      const file = await ctx.api.getFile(largest.file_id);
-      const url = `https://api.telegram.org/file/bot${config.telegram.botToken}/${file.file_path}`;
-      const response = await fetch(url);
-      if (!response.ok) throw new Error(`download failed HTTP ${response.status}`);
-      const buf = Buffer.from(await response.arrayBuffer());
-      mkdirSync(IMAGE_TMP_DIR, { recursive: true });
-      tempPath = join(IMAGE_TMP_DIR, `${Date.now()}-${largest.file_id}.jpg`);
-      writeFileSync(tempPath, buf);
+      ({ path } = await downloadAttachment(ctx, largest.file_id, { botToken: config.telegram.botToken, hint: 'photo.jpg' }));
     } catch (e) {
-      log.error('failed to download photo', { err: e.message, chatId: ctx.chat.id });
+      log.error('photo download failed', { err: e.message, chatId: ctx.chat.id });
       await ctx.reply(`⚠️ Не смог скачать фото: ${e.message}`).catch(() => {});
       return;
     }
+    await handleMessage(ctx, caption, [path]);
+    scheduleCleanup(path);
+  });
 
-    await handleMessage(ctx, caption, [tempPath]);
-    setTimeout(() => { try { unlinkSync(tempPath); } catch {} }, IMAGE_CLEANUP_MS);
+  bot.on('message:document', async (ctx) => {
+    if (!isAllowed(ctx)) return;
+    await reactSafe(ctx, '👀');
+    const doc = ctx.message.document;
+    let path, sizeBytes;
+    try {
+      ({ path, sizeBytes } = await downloadAttachment(ctx, doc.file_id, { botToken: config.telegram.botToken, hint: doc.file_name }));
+    } catch (e) {
+      log.error('document download failed', { err: e.message, chatId: ctx.chat.id });
+      await ctx.reply(`⚠️ Не смог скачать документ: ${e.message}`).catch(() => {});
+      return;
+    }
+    const userPrompt = ctx.message.caption || 'Изучи присланный файл и ответь по нему. Если не уверен в формате — определи по расширению/содержимому и используй подходящий инструмент.';
+    const prompt = `${userPrompt}
+
+Файл сохранён локально: ${path}
+Имя: ${doc.file_name || '(без имени)'}
+MIME: ${doc.mime_type || '(неизвестен)'}
+Размер: ${sizeBytes} байт
+
+Прочитай файл подходящим способом (Get-Content для текста, node ${config.codex.workspaceDir}\\extract_pdf.mjs для PDF, и т.д.) и ответь.`;
+    await handleMessage(ctx, prompt);
+    scheduleCleanup(path);
+  });
+
+  bot.on('message:voice', async (ctx) => {
+    if (!isAllowed(ctx)) return;
+    await reactSafe(ctx, '👀');
+    const voice = ctx.message.voice;
+    let path;
+    try {
+      ({ path } = await downloadAttachment(ctx, voice.file_id, { botToken: config.telegram.botToken, hint: 'voice.ogg' }));
+    } catch (e) {
+      log.error('voice download failed', { err: e.message, chatId: ctx.chat.id });
+      await ctx.reply(`⚠️ Не смог скачать голос: ${e.message}`).catch(() => {});
+      return;
+    }
+    const prompt = `Пользователь прислал голосовое сообщение (длительность ${voice.duration}с).
+
+Файл: ${path}
+
+Транскрибируй его (через Whisper — в workspace есть установка) и отвечай по содержанию. Если транскрипция требует подтверждения — сначала покажи распознанный текст.`;
+    await handleMessage(ctx, prompt);
+    scheduleCleanup(path);
+  });
+
+  bot.on('message:audio', async (ctx) => {
+    if (!isAllowed(ctx)) return;
+    await reactSafe(ctx, '👀');
+    const audio = ctx.message.audio;
+    let path;
+    try {
+      ({ path } = await downloadAttachment(ctx, audio.file_id, { botToken: config.telegram.botToken, hint: audio.file_name || 'audio' }));
+    } catch (e) {
+      log.error('audio download failed', { err: e.message, chatId: ctx.chat.id });
+      await ctx.reply(`⚠️ Не смог скачать аудио: ${e.message}`).catch(() => {});
+      return;
+    }
+    const userPrompt = ctx.message.caption || 'Аудиозапись. Транскрибируй и отвечай по содержанию.';
+    const prompt = `${userPrompt}
+
+Файл: ${path}
+Имя: ${audio.file_name || '(без имени)'}
+Длительность: ${audio.duration}с
+Исполнитель: ${audio.performer || '(нет)'}, название: ${audio.title || '(нет)'}`;
+    await handleMessage(ctx, prompt);
+    scheduleCleanup(path);
+  });
+
+  bot.on('message:video', async (ctx) => {
+    if (!isAllowed(ctx)) return;
+    await reactSafe(ctx, '👀');
+    const video = ctx.message.video;
+    let path;
+    try {
+      ({ path } = await downloadAttachment(ctx, video.file_id, { botToken: config.telegram.botToken, hint: video.file_name || 'video.mp4' }));
+    } catch (e) {
+      log.error('video download failed', { err: e.message, chatId: ctx.chat.id });
+      await ctx.reply(`⚠️ Не смог скачать видео: ${e.message}`).catch(() => {});
+      return;
+    }
+    const userPrompt = ctx.message.caption || 'Видеосообщение. Опиши содержание (если нужна транскрипция аудио — извлеки через ffmpeg + Whisper).';
+    const prompt = `${userPrompt}
+
+Файл: ${path}
+Длительность: ${video.duration}с, ${video.width}x${video.height}`;
+    await handleMessage(ctx, prompt);
+    scheduleCleanup(path);
+  });
+
+  bot.on('message:video_note', async (ctx) => {
+    if (!isAllowed(ctx)) return;
+    await reactSafe(ctx, '👀');
+    const vn = ctx.message.video_note;
+    let path;
+    try {
+      ({ path } = await downloadAttachment(ctx, vn.file_id, { botToken: config.telegram.botToken, hint: 'circle_video.mp4' }));
+    } catch (e) {
+      log.error('video_note download failed', { err: e.message, chatId: ctx.chat.id });
+      await ctx.reply(`⚠️ Не смог скачать кружок: ${e.message}`).catch(() => {});
+      return;
+    }
+    const prompt = `Пользователь прислал видеосообщение-кружок (${vn.duration}с).
+
+Файл: ${path}
+
+Извлеки аудио (ffmpeg) и транскрибируй (Whisper), затем отвечай по содержанию.`;
+    await handleMessage(ctx, prompt);
+    scheduleCleanup(path);
   });
 
   async function handleMessage(ctx, prompt, images = null) {
@@ -103,6 +205,7 @@ export function createBot({ config, sessions, queue, log }) {
     } catch (e) {
       lastError = `${new Date().toISOString()} ${e.message}`;
       log.error('queue rejected', { err: e.message, chatId });
+      await reactSafe(ctx, '💔');
       await ctx.api.editMessageText(chatId, placeholder.message_id, `⚠️ ${e.message}`).catch(() => {});
     }
   }
@@ -161,6 +264,9 @@ export function createBot({ config, sessions, queue, log }) {
     if (result.exitCode !== 0) {
       lastError = `${new Date().toISOString()} codex exit ${result.exitCode}: ${result.stderr.slice(0, 300)}`;
       log.error('codex exited non-zero', { exitCode: result.exitCode, stderr: result.stderr.slice(0, 1000), chatId });
+      await reactSafe(ctx, '💔');
+    } else if (buf.length > 0) {
+      await reactSafe(ctx, '👍');
     }
   }
 
