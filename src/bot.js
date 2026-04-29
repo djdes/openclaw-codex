@@ -50,20 +50,17 @@ export function createBot({ config, sessions, queue, log }) {
 
   bot.command('whoami', async (ctx) => {
     if (!isAllowed(ctx)) return;
-    await reactSafe(ctx, '👀');
     await handleMessage(ctx, 'Представься коротко в одну строку.');
   });
 
   bot.on('message:text', async (ctx) => {
     if (!isAllowed(ctx)) return;
     if (ctx.message.text.startsWith('/')) return;
-    await reactSafe(ctx, '👀');
     await handleMessage(ctx, ctx.message.text);
   });
 
   bot.on('message:photo', async (ctx) => {
     if (!isAllowed(ctx)) return;
-    await reactSafe(ctx, '👀');
     const photos = ctx.message.photo;
     const largest = photos[photos.length - 1];
     const caption = ctx.message.caption || 'Что на изображении? Опиши кратко.';
@@ -81,8 +78,7 @@ export function createBot({ config, sessions, queue, log }) {
 
   bot.on('message:document', async (ctx) => {
     if (!isAllowed(ctx)) return;
-    await reactSafe(ctx, '👀');
-    const doc = ctx.message.document;
+const doc = ctx.message.document;
     let path, sizeBytes;
     try {
       ({ path, sizeBytes } = await downloadAttachment(ctx, doc.file_id, { botToken: config.telegram.botToken, hint: doc.file_name }));
@@ -106,8 +102,7 @@ MIME: ${doc.mime_type || '(неизвестен)'}
 
   bot.on('message:voice', async (ctx) => {
     if (!isAllowed(ctx)) return;
-    await reactSafe(ctx, '👀');
-    const voice = ctx.message.voice;
+const voice = ctx.message.voice;
     let path;
     try {
       ({ path } = await downloadAttachment(ctx, voice.file_id, { botToken: config.telegram.botToken, hint: 'voice.ogg' }));
@@ -127,8 +122,7 @@ MIME: ${doc.mime_type || '(неизвестен)'}
 
   bot.on('message:audio', async (ctx) => {
     if (!isAllowed(ctx)) return;
-    await reactSafe(ctx, '👀');
-    const audio = ctx.message.audio;
+const audio = ctx.message.audio;
     let path;
     try {
       ({ path } = await downloadAttachment(ctx, audio.file_id, { botToken: config.telegram.botToken, hint: audio.file_name || 'audio' }));
@@ -150,8 +144,7 @@ MIME: ${doc.mime_type || '(неизвестен)'}
 
   bot.on('message:video', async (ctx) => {
     if (!isAllowed(ctx)) return;
-    await reactSafe(ctx, '👀');
-    const video = ctx.message.video;
+const video = ctx.message.video;
     let path;
     try {
       ({ path } = await downloadAttachment(ctx, video.file_id, { botToken: config.telegram.botToken, hint: video.file_name || 'video.mp4' }));
@@ -171,8 +164,7 @@ MIME: ${doc.mime_type || '(неизвестен)'}
 
   bot.on('message:video_note', async (ctx) => {
     if (!isAllowed(ctx)) return;
-    await reactSafe(ctx, '👀');
-    const vn = ctx.message.video_note;
+const vn = ctx.message.video_note;
     let path;
     try {
       ({ path } = await downloadAttachment(ctx, vn.file_id, { botToken: config.telegram.botToken, hint: 'circle_video.mp4' }));
@@ -205,9 +197,17 @@ MIME: ${doc.mime_type || '(неизвестен)'}
     } catch (e) {
       lastError = `${new Date().toISOString()} ${e.message}`;
       log.error('queue rejected', { err: e.message, chatId });
-      await reactSafe(ctx, '💔');
       await ctx.api.editMessageText(chatId, placeholder.message_id, `⚠️ ${e.message}`).catch(() => {});
     }
+  }
+
+  function extractReaction(text) {
+    const m = text.match(/\[react:([^\]]+)\]/i);
+    if (!m) return { emoji: null, cleaned: text };
+    return {
+      emoji: m[1].trim(),
+      cleaned: text.replace(/\[react:[^\]]+\]/gi, '').trim()
+    };
   }
 
   async function runOneTurn(ctx, prompt, placeholderId, chatId, images = null) {
@@ -252,21 +252,21 @@ MIME: ${doc.mime_type || '(неизвестен)'}
     });
 
     if (editPending) { clearTimeout(editPending); editPending = null; }
-    const finalText = buf.length === 0
+    const { emoji, cleaned } = extractReaction(buf);
+    const finalText = cleaned.length === 0
       ? (result.exitCode === 0 ? '(пустой ответ)' : `⚠️ codex exit ${result.exitCode}\n${result.stderr.slice(0, 500)}`)
-      : (buf.length > 4000 ? buf.slice(0, 4000) + '…' : buf);
+      : (cleaned.length > 4000 ? cleaned.slice(0, 4000) + '…' : cleaned);
 
     try { await ctx.api.editMessageText(chatId, placeholderId, finalText); }
     catch (e) { log.warn('final editMessageText failed', { err: e.message }); }
 
     if (newSessionId) sessions.set(chatId, newSessionId);
 
+    if (emoji) await reactSafe(ctx, emoji);
+
     if (result.exitCode !== 0) {
       lastError = `${new Date().toISOString()} codex exit ${result.exitCode}: ${result.stderr.slice(0, 300)}`;
       log.error('codex exited non-zero', { exitCode: result.exitCode, stderr: result.stderr.slice(0, 1000), chatId });
-      await reactSafe(ctx, '💔');
-    } else if (buf.length > 0) {
-      await reactSafe(ctx, '👍');
     }
   }
 
