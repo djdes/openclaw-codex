@@ -1,5 +1,11 @@
 import { Bot } from 'grammy';
+import { writeFileSync, mkdirSync, unlinkSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { runCodex, extractTextDelta, extractSessionId, extractTaskComplete } from './codex.js';
+
+const IMAGE_TMP_DIR = join(tmpdir(), 'openclaw-codex-images');
+const IMAGE_CLEANUP_MS = 5 * 60 * 1000;
 
 const HELP_TEXT = `Codex-powered Клауд bridge.
 
@@ -56,7 +62,33 @@ export function createBot({ config, sessions, queue, log }) {
     await handleMessage(ctx, ctx.message.text);
   });
 
-  async function handleMessage(ctx, prompt) {
+  bot.on('message:photo', async (ctx) => {
+    if (!isAllowed(ctx)) return;
+    const photos = ctx.message.photo;
+    const largest = photos[photos.length - 1];
+    const caption = ctx.message.caption || 'Что на изображении? Опиши кратко.';
+
+    let tempPath;
+    try {
+      const file = await ctx.api.getFile(largest.file_id);
+      const url = `https://api.telegram.org/file/bot${config.telegram.botToken}/${file.file_path}`;
+      const response = await fetch(url);
+      if (!response.ok) throw new Error(`download failed HTTP ${response.status}`);
+      const buf = Buffer.from(await response.arrayBuffer());
+      mkdirSync(IMAGE_TMP_DIR, { recursive: true });
+      tempPath = join(IMAGE_TMP_DIR, `${Date.now()}-${largest.file_id}.jpg`);
+      writeFileSync(tempPath, buf);
+    } catch (e) {
+      log.error('failed to download photo', { err: e.message, chatId: ctx.chat.id });
+      await ctx.reply(`⚠️ Не смог скачать фото: ${e.message}`).catch(() => {});
+      return;
+    }
+
+    await handleMessage(ctx, caption, [tempPath]);
+    setTimeout(() => { try { unlinkSync(tempPath); } catch {} }, IMAGE_CLEANUP_MS);
+  });
+
+  async function handleMessage(ctx, prompt, images = null) {
     const chatId = ctx.chat.id;
     let placeholder;
     try {
@@ -67,7 +99,7 @@ export function createBot({ config, sessions, queue, log }) {
     }
 
     try {
-      await queue.enqueue(chatId, () => runOneTurn(ctx, prompt, placeholder.message_id, chatId));
+      await queue.enqueue(chatId, () => runOneTurn(ctx, prompt, placeholder.message_id, chatId, images));
     } catch (e) {
       lastError = `${new Date().toISOString()} ${e.message}`;
       log.error('queue rejected', { err: e.message, chatId });
@@ -75,7 +107,7 @@ export function createBot({ config, sessions, queue, log }) {
     }
   }
 
-  async function runOneTurn(ctx, prompt, placeholderId, chatId) {
+  async function runOneTurn(ctx, prompt, placeholderId, chatId, images = null) {
     const sessionId = sessions.get(chatId);
     let buf = '';
     let lastEditAt = 0;
@@ -103,6 +135,7 @@ export function createBot({ config, sessions, queue, log }) {
       approval: config.codex.approval,
       sessionId,
       prompt,
+      images,
       timeoutMs: config.codex.execTimeoutMs,
       onEvent: (ev) => {
         const sid = extractSessionId(ev);

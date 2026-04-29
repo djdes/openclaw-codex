@@ -67,15 +67,20 @@ export function runCodex(opts) {
   // and `opts.approval` in the config schema for forward compatibility but
   // they are not currently passed to the CLI.
   // Codex 0.125 syntax differs between fresh exec and resume:
-  //   fresh:  codex exec --json --cd <dir> --full-auto -
-  //   resume: codex exec resume --json <SESSION_ID> --full-auto -
+  //   fresh:  codex exec --json --cd <dir> --full-auto [-i <img>]... -
+  //   resume: codex exec resume --json --full-auto [-i <img>]... <SESSION_ID> -
   // Resume does NOT accept --cd (inherits workspace from the original session).
-  // Session id is positional after `resume`.
+  // Session id is positional after `resume` (after options).
+  // Images: codex `-i, --image <FILE>` (repeatable on both fresh and resume).
+  const imageArgs = [];
+  if (opts.images?.length) {
+    for (const img of opts.images) imageArgs.push('-i', img);
+  }
   const args = ['exec'];
   if (opts.sessionId) {
-    args.push('resume', '--json', opts.sessionId, '--full-auto', '-');
+    args.push('resume', '--json', '--full-auto', ...imageArgs, opts.sessionId, '-');
   } else {
-    args.push('--json', '--cd', opts.workspaceDir, '--full-auto', '-');
+    args.push('--json', '--cd', opts.workspaceDir, '--full-auto', ...imageArgs, '-');
   }
 
   return new Promise((resolve, reject) => {
