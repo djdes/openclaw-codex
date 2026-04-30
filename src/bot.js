@@ -9,19 +9,40 @@ const HELP_TEXT = `Codex-powered Клауд bridge.
 /status — статус процесса
 /whoami — кратко представиться
 
-Поддерживаемые вложения: фото, документы (PDF/DOCX/TXT/CSV/JSON/любые), голосовые, аудио, видео, видеосообщения. Файл скачивается и Codex читает его инструментами в workspace.`;
+Поддерживаемые вложения: фото, документы (PDF/DOCX/TXT/CSV/JSON/любые), голосовые, аудио, видео, видеосообщения.`;
 
-export function createBot({ config, sessions, queue, log }) {
-  const bot = new Bot(config.telegram.botToken);
+/**
+ * Build a single Telegram bot instance bound to one bot config.
+ *
+ * @param {object} args
+ * @param {object} args.botConfig    — per-bot fields: name, botToken, ownerUserId, allowedUserIds, allowedGroupIds, rolePrompt, sessionsPath
+ * @param {object} args.codexConfig  — shared codex backend settings
+ * @param {object} args.telegramConfig — shared throttling/queue
+ * @param {object} args.sessions     — session store (one per bot)
+ * @param {object} args.queue        — shared queue (per-chat keys are unique across bots)
+ * @param {object} args.log          — logger
+ */
+export function createBot({ botConfig, codexConfig, telegramConfig, sessions, queue, log }) {
+  const bot = new Bot(botConfig.botToken);
   const startedAt = Date.now();
   let lastError = null;
 
   function isAllowed(ctx) {
     const fromId = ctx.from?.id;
     const chatId = ctx.chat?.id;
-    if (fromId === config.telegram.ownerUserId) return true;
-    if (config.telegram.allowedGroupIds.includes(chatId)) return true;
+    if (fromId === botConfig.ownerUserId) return true;
+    if (botConfig.allowedUserIds.includes(fromId)) return true;
+    if (botConfig.allowedGroupIds.includes(chatId)) return true;
     return false;
+  }
+
+  // Compose the chat-id key as <botName>:<chatId> so two bots talking to the same user
+  // don't share session/queue state.
+  function key(chatId) { return `${botConfig.name}:${chatId}`; }
+
+  function decoratePrompt(userPrompt) {
+    if (!botConfig.rolePrompt) return userPrompt;
+    return `[Bridge: ${botConfig.rolePrompt}]\n\n${userPrompt}`;
   }
 
   bot.command('start', async (ctx) => {
@@ -31,18 +52,19 @@ export function createBot({ config, sessions, queue, log }) {
 
   bot.command('reset', async (ctx) => {
     if (!isAllowed(ctx)) return;
-    sessions.delete(ctx.chat.id);
+    sessions.delete(key(ctx.chat.id));
     await ctx.reply('Сессия сброшена. Следующее сообщение начнёт новый контекст.');
   });
 
   bot.command('status', async (ctx) => {
     if (!isAllowed(ctx)) return;
     const uptimeSec = Math.floor((Date.now() - startedAt) / 1000);
-    const sid = sessions.get(ctx.chat.id);
+    const sid = sessions.get(key(ctx.chat.id));
     const msg = [
+      `bot: ${botConfig.name}`,
       `uptime: ${uptimeSec}s`,
       `session: ${sid || '(none)'}`,
-      `queue depth: ${queue.depth(ctx.chat.id)}`,
+      `queue depth: ${queue.depth(key(ctx.chat.id))}`,
       `last error: ${lastError || '(none)'}`
     ].join('\n');
     await ctx.reply(msg);
@@ -66,9 +88,9 @@ export function createBot({ config, sessions, queue, log }) {
     const caption = ctx.message.caption || 'Что на изображении? Опиши кратко.';
     let path;
     try {
-      ({ path } = await downloadAttachment(ctx, largest.file_id, { botToken: config.telegram.botToken, hint: 'photo.jpg' }));
+      ({ path } = await downloadAttachment(ctx, largest.file_id, { botToken: botConfig.botToken, hint: 'photo.jpg' }));
     } catch (e) {
-      log.error('photo download failed', { err: e.message, chatId: ctx.chat.id });
+      log.error('photo download failed', { err: e.message, bot: botConfig.name, chatId: ctx.chat.id });
       await ctx.reply(`⚠️ Не смог скачать фото: ${e.message}`).catch(() => {});
       return;
     }
@@ -78,16 +100,16 @@ export function createBot({ config, sessions, queue, log }) {
 
   bot.on('message:document', async (ctx) => {
     if (!isAllowed(ctx)) return;
-const doc = ctx.message.document;
+    const doc = ctx.message.document;
     let path, sizeBytes;
     try {
-      ({ path, sizeBytes } = await downloadAttachment(ctx, doc.file_id, { botToken: config.telegram.botToken, hint: doc.file_name }));
+      ({ path, sizeBytes } = await downloadAttachment(ctx, doc.file_id, { botToken: botConfig.botToken, hint: doc.file_name }));
     } catch (e) {
-      log.error('document download failed', { err: e.message, chatId: ctx.chat.id });
+      log.error('document download failed', { err: e.message, bot: botConfig.name, chatId: ctx.chat.id });
       await ctx.reply(`⚠️ Не смог скачать документ: ${e.message}`).catch(() => {});
       return;
     }
-    const userPrompt = ctx.message.caption || 'Изучи присланный файл и ответь по нему. Если не уверен в формате — определи по расширению/содержимому и используй подходящий инструмент.';
+    const userPrompt = ctx.message.caption || 'Изучи присланный файл и ответь по нему.';
     const prompt = `${userPrompt}
 
 Файл сохранён локально: ${path}
@@ -95,39 +117,39 @@ const doc = ctx.message.document;
 MIME: ${doc.mime_type || '(неизвестен)'}
 Размер: ${sizeBytes} байт
 
-Прочитай файл подходящим способом (Get-Content для текста, node ${config.codex.workspaceDir}\\extract_pdf.mjs для PDF, и т.д.) и ответь.`;
+Прочитай файл подходящим способом (Codex skills pdf/doc/spreadsheet, Get-Content для текста и т.д.) и ответь.`;
     await handleMessage(ctx, prompt);
     scheduleCleanup(path);
   });
 
   bot.on('message:voice', async (ctx) => {
     if (!isAllowed(ctx)) return;
-const voice = ctx.message.voice;
+    const voice = ctx.message.voice;
     let path;
     try {
-      ({ path } = await downloadAttachment(ctx, voice.file_id, { botToken: config.telegram.botToken, hint: 'voice.ogg' }));
+      ({ path } = await downloadAttachment(ctx, voice.file_id, { botToken: botConfig.botToken, hint: 'voice.ogg' }));
     } catch (e) {
-      log.error('voice download failed', { err: e.message, chatId: ctx.chat.id });
+      log.error('voice download failed', { err: e.message, bot: botConfig.name, chatId: ctx.chat.id });
       await ctx.reply(`⚠️ Не смог скачать голос: ${e.message}`).catch(() => {});
       return;
     }
-    const prompt = `Пользователь прислал голосовое сообщение (длительность ${voice.duration}с).
+    const prompt = `Пользователь прислал голосовое сообщение (${voice.duration}с).
 
 Файл: ${path}
 
-Транскрибируй его (через Whisper — в workspace есть установка) и отвечай по содержанию. Если транскрипция требует подтверждения — сначала покажи распознанный текст.`;
+Транскрибируй его (Whisper в workspace) и отвечай по содержанию.`;
     await handleMessage(ctx, prompt);
     scheduleCleanup(path);
   });
 
   bot.on('message:audio', async (ctx) => {
     if (!isAllowed(ctx)) return;
-const audio = ctx.message.audio;
+    const audio = ctx.message.audio;
     let path;
     try {
-      ({ path } = await downloadAttachment(ctx, audio.file_id, { botToken: config.telegram.botToken, hint: audio.file_name || 'audio' }));
+      ({ path } = await downloadAttachment(ctx, audio.file_id, { botToken: botConfig.botToken, hint: audio.file_name || 'audio' }));
     } catch (e) {
-      log.error('audio download failed', { err: e.message, chatId: ctx.chat.id });
+      log.error('audio download failed', { err: e.message, bot: botConfig.name, chatId: ctx.chat.id });
       await ctx.reply(`⚠️ Не смог скачать аудио: ${e.message}`).catch(() => {});
       return;
     }
@@ -144,12 +166,12 @@ const audio = ctx.message.audio;
 
   bot.on('message:video', async (ctx) => {
     if (!isAllowed(ctx)) return;
-const video = ctx.message.video;
+    const video = ctx.message.video;
     let path;
     try {
-      ({ path } = await downloadAttachment(ctx, video.file_id, { botToken: config.telegram.botToken, hint: video.file_name || 'video.mp4' }));
+      ({ path } = await downloadAttachment(ctx, video.file_id, { botToken: botConfig.botToken, hint: video.file_name || 'video.mp4' }));
     } catch (e) {
-      log.error('video download failed', { err: e.message, chatId: ctx.chat.id });
+      log.error('video download failed', { err: e.message, bot: botConfig.name, chatId: ctx.chat.id });
       await ctx.reply(`⚠️ Не смог скачать видео: ${e.message}`).catch(() => {});
       return;
     }
@@ -164,12 +186,12 @@ const video = ctx.message.video;
 
   bot.on('message:video_note', async (ctx) => {
     if (!isAllowed(ctx)) return;
-const vn = ctx.message.video_note;
+    const vn = ctx.message.video_note;
     let path;
     try {
-      ({ path } = await downloadAttachment(ctx, vn.file_id, { botToken: config.telegram.botToken, hint: 'circle_video.mp4' }));
+      ({ path } = await downloadAttachment(ctx, vn.file_id, { botToken: botConfig.botToken, hint: 'circle_video.mp4' }));
     } catch (e) {
-      log.error('video_note download failed', { err: e.message, chatId: ctx.chat.id });
+      log.error('video_note download failed', { err: e.message, bot: botConfig.name, chatId: ctx.chat.id });
       await ctx.reply(`⚠️ Не смог скачать кружок: ${e.message}`).catch(() => {});
       return;
     }
@@ -182,21 +204,23 @@ const vn = ctx.message.video_note;
     scheduleCleanup(path);
   });
 
-  async function handleMessage(ctx, prompt, images = null) {
+  async function handleMessage(ctx, rawPrompt, images = null) {
     const chatId = ctx.chat.id;
+    const k = key(chatId);
+    const prompt = decoratePrompt(rawPrompt);
     let placeholder;
     try {
       placeholder = await ctx.reply('⌛ думаю…');
     } catch (e) {
-      log.error('failed to send placeholder', { err: e.message, chatId });
+      log.error('failed to send placeholder', { err: e.message, bot: botConfig.name, chatId });
       return;
     }
 
     try {
-      await queue.enqueue(chatId, () => runOneTurn(ctx, prompt, placeholder.message_id, chatId, images));
+      await queue.enqueue(k, () => runOneTurn(ctx, prompt, placeholder.message_id, chatId, k, images));
     } catch (e) {
       lastError = `${new Date().toISOString()} ${e.message}`;
-      log.error('queue rejected', { err: e.message, chatId });
+      log.error('queue rejected', { err: e.message, bot: botConfig.name, chatId });
       await ctx.api.editMessageText(chatId, placeholder.message_id, `⚠️ ${e.message}`).catch(() => {});
     }
   }
@@ -210,15 +234,15 @@ const vn = ctx.message.video_note;
     };
   }
 
-  async function runOneTurn(ctx, prompt, placeholderId, chatId, images = null) {
-    const sessionId = sessions.get(chatId);
+  async function runOneTurn(ctx, prompt, placeholderId, chatId, sessionKey, images = null) {
+    const sessionId = sessions.get(sessionKey);
     let buf = '';
     let lastEditAt = 0;
     let editPending = null;
 
     function scheduleEdit() {
       const now = Date.now();
-      const delay = Math.max(0, config.telegram.streamThrottleMs - (now - lastEditAt));
+      const delay = Math.max(0, telegramConfig.streamThrottleMs - (now - lastEditAt));
       if (editPending) return;
       editPending = setTimeout(async () => {
         editPending = null;
@@ -232,14 +256,14 @@ const vn = ctx.message.video_note;
 
     let newSessionId = null;
     const result = await runCodex({
-      binary: config.codex.binary,
-      workspaceDir: config.codex.workspaceDir,
-      sandbox: config.codex.sandbox,
-      approval: config.codex.approval,
+      binary: codexConfig.binary,
+      workspaceDir: codexConfig.workspaceDir,
+      sandbox: codexConfig.sandbox,
+      approval: codexConfig.approval,
       sessionId,
       prompt,
       images,
-      timeoutMs: config.codex.execTimeoutMs,
+      timeoutMs: codexConfig.execTimeoutMs,
       onEvent: (ev) => {
         const sid = extractSessionId(ev);
         if (sid) newSessionId = sid;
@@ -260,19 +284,19 @@ const vn = ctx.message.video_note;
     try { await ctx.api.editMessageText(chatId, placeholderId, finalText); }
     catch (e) { log.warn('final editMessageText failed', { err: e.message }); }
 
-    if (newSessionId) sessions.set(chatId, newSessionId);
+    if (newSessionId) sessions.set(sessionKey, newSessionId);
 
     if (emoji) await reactSafe(ctx, emoji);
 
     if (result.exitCode !== 0) {
       lastError = `${new Date().toISOString()} codex exit ${result.exitCode}: ${result.stderr.slice(0, 300)}`;
-      log.error('codex exited non-zero', { exitCode: result.exitCode, stderr: result.stderr.slice(0, 1000), chatId });
+      log.error('codex exited non-zero', { exitCode: result.exitCode, stderr: result.stderr.slice(0, 1000), bot: botConfig.name, chatId });
     }
   }
 
   bot.catch((err) => {
     lastError = `${new Date().toISOString()} ${err.error?.message || err.message}`;
-    log.error('grammy uncaught', { err: err.error?.message || err.message });
+    log.error('grammy uncaught', { err: err.error?.message || err.message, bot: botConfig.name });
   });
 
   return bot;
