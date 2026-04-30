@@ -1,5 +1,7 @@
 import { Bot } from 'grammy';
-import { runCodex, extractTextDelta, extractSessionId, extractTaskComplete } from './codex.js';
+import { runCodex, extractTextDelta, extractSessionId, extractTaskComplete, extractActivity } from './codex.js';
+
+const PROGRESS_INTERVAL_MS = 8000;
 import { downloadAttachment, scheduleCleanup, reactSafe } from './attachments.js';
 
 const HELP_TEXT = `Codex-powered Клауд bridge.
@@ -236,23 +238,34 @@ MIME: ${doc.mime_type || '(неизвестен)'}
 
   async function runOneTurn(ctx, prompt, placeholderId, chatId, sessionKey, images = null) {
     const sessionId = sessions.get(sessionKey);
+    const startedAt = Date.now();
     let buf = '';
-    let lastEditAt = 0;
+    let lastActivity = '⏳ запускаю';
+    let lastShownText = '⌛ думаю…';
     let editPending = null;
 
     function scheduleEdit() {
-      const now = Date.now();
-      const delay = Math.max(0, telegramConfig.streamThrottleMs - (now - lastEditAt));
       if (editPending) return;
       editPending = setTimeout(async () => {
         editPending = null;
-        lastEditAt = Date.now();
         const text = buf.length > 4000 ? buf.slice(0, 4000) + '…' : buf;
-        if (text.length === 0) return;
+        if (text.length === 0 || text === lastShownText) return;
+        lastShownText = text;
         try { await ctx.api.editMessageText(chatId, placeholderId, text); }
         catch (e) { log.warn('editMessageText failed', { err: e.message }); }
-      }, delay);
+      }, telegramConfig.streamThrottleMs);
     }
+
+    // Periodic progress update while codex is working (no streaming deltas in 0.125 exec mode).
+    const progressTimer = setInterval(async () => {
+      if (buf.length > 0) return; // once we have text, scheduleEdit takes over
+      const elapsedSec = Math.floor((Date.now() - startedAt) / 1000);
+      const text = `⌛ думаю (${elapsedSec}с)\n${lastActivity}`;
+      if (text === lastShownText) return;
+      lastShownText = text;
+      try { await ctx.api.editMessageText(chatId, placeholderId, text); }
+      catch (e) { log.warn('progress editMessageText failed', { err: e.message }); }
+    }, PROGRESS_INTERVAL_MS);
 
     let newSessionId = null;
     const result = await runCodex({
@@ -267,6 +280,8 @@ MIME: ${doc.mime_type || '(неизвестен)'}
       onEvent: (ev) => {
         const sid = extractSessionId(ev);
         if (sid) newSessionId = sid;
+        const activity = extractActivity(ev);
+        if (activity) lastActivity = activity;
         const delta = extractTextDelta(ev);
         if (delta) { buf += delta; scheduleEdit(); }
         if (extractTaskComplete(ev)) {
@@ -275,6 +290,7 @@ MIME: ${doc.mime_type || '(неизвестен)'}
       }
     });
 
+    clearInterval(progressTimer);
     if (editPending) { clearTimeout(editPending); editPending = null; }
     const { emoji, cleaned } = extractReaction(buf);
     const finalText = cleaned.length === 0

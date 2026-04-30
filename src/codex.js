@@ -37,6 +37,29 @@ export function extractTaskComplete(ev) {
 }
 
 /**
+ * Returns a short human-readable label for the current Codex activity, or null
+ * if the event isn't a useful progress signal. Used to keep the user informed
+ * during long turns where Codex 0.125 doesn't stream message deltas.
+ */
+export function extractActivity(ev) {
+  if (!ev || typeof ev !== 'object') return null;
+  if (ev.type === 'item.started' && ev.item) {
+    const it = ev.item;
+    if (it.type === 'command_execution' && typeof it.command === 'string') {
+      const cmd = it.command.replace(/\s+/g, ' ').trim();
+      return `🔧 ${cmd.length > 80 ? cmd.slice(0, 77) + '…' : cmd}`;
+    }
+    if (it.type === 'reasoning' || it.type === 'thinking') return '🤔 размышляю';
+    if (it.type === 'web_search') return '🌐 веб-поиск';
+    if (it.type === 'file_search') return '🔍 поиск по файлам';
+    if (it.type === 'agent_message') return '✍️ пишу ответ';
+    if (typeof it.type === 'string') return `▶ ${it.type}`;
+  }
+  if (ev.type === 'turn.started') return '⏳ старт хода';
+  return null;
+}
+
+/**
  * Spawn `codex exec` (or `codex exec resume`) and yield NDJSON events.
  * The user's prompt is piped via stdin (codex's `-` argument) rather than
  * passed as a positional argument. This is required because:
