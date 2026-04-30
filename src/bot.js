@@ -236,6 +236,31 @@ MIME: ${doc.mime_type || '(неизвестен)'}
     };
   }
 
+  // Split a long reply into multiple Telegram messages.
+  //   1) Honor explicit `\n---\n` markers from the agent (each becomes its own message).
+  //   2) Otherwise, if the reply is long (>1500 chars) AND has paragraph breaks,
+  //      auto-chunk on `\n\n` boundaries to ~1500 chars per message.
+  //   3) Hard-cap each chunk at 4000 chars (Telegram's limit is 4096).
+  function splitReply(text) {
+    const explicit = text.split(/\n[ \t]*-{3,}[ \t]*\n/).map(s => s.trim()).filter(Boolean);
+    let chunks = explicit.length > 1 ? explicit : [text];
+
+    if (chunks.length === 1 && chunks[0].length > 1500 && chunks[0].includes('\n\n')) {
+      const paragraphs = chunks[0].split(/\n\n+/).map(p => p.trim()).filter(Boolean);
+      const auto = [];
+      let cur = '';
+      for (const p of paragraphs) {
+        if (cur.length === 0) { cur = p; continue; }
+        if ((cur + '\n\n' + p).length > 1500) { auto.push(cur); cur = p; }
+        else { cur += '\n\n' + p; }
+      }
+      if (cur) auto.push(cur);
+      chunks = auto;
+    }
+
+    return chunks.map(c => c.length > 4000 ? c.slice(0, 4000) + '…' : c);
+  }
+
   async function runOneTurn(ctx, prompt, placeholderId, chatId, sessionKey, images = null) {
     const sessionId = sessions.get(sessionKey);
     const startedAt = Date.now();
@@ -293,12 +318,23 @@ MIME: ${doc.mime_type || '(неизвестен)'}
     clearInterval(progressTimer);
     if (editPending) { clearTimeout(editPending); editPending = null; }
     const { emoji, cleaned } = extractReaction(buf);
-    const finalText = cleaned.length === 0
-      ? (result.exitCode === 0 ? '(пустой ответ)' : `⚠️ codex exit ${result.exitCode}\n${result.stderr.slice(0, 500)}`)
-      : (cleaned.length > 4000 ? cleaned.slice(0, 4000) + '…' : cleaned);
 
-    try { await ctx.api.editMessageText(chatId, placeholderId, finalText); }
+    let parts;
+    if (cleaned.length === 0) {
+      parts = [result.exitCode === 0
+        ? '(пустой ответ)'
+        : `⚠️ codex exit ${result.exitCode}\n${result.stderr.slice(0, 500)}`];
+    } else {
+      parts = splitReply(cleaned);
+    }
+
+    // First part replaces the placeholder; subsequent parts go as new messages.
+    try { await ctx.api.editMessageText(chatId, placeholderId, parts[0]); }
     catch (e) { log.warn('final editMessageText failed', { err: e.message }); }
+    for (let i = 1; i < parts.length; i++) {
+      try { await ctx.api.sendMessage(chatId, parts[i]); }
+      catch (e) { log.warn('sendMessage (part) failed', { err: e.message, partIdx: i }); }
+    }
 
     if (newSessionId) sessions.set(sessionKey, newSessionId);
 
