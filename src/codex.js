@@ -106,16 +106,35 @@ export function runCodex(opts) {
     args.push('--json', '--cd', opts.workspaceDir, '--full-auto', ...imageArgs, '-');
   }
 
+  // Codex 0.125 has a known bug where models_manager hangs after a successful
+  // turn ("failed to refresh available models: timeout") — the process keeps
+  // running for minutes even though the agent_message item already shipped.
+  // Strategy: once we observe agent_message text OR turn.completed, give the
+  // process POST_TASK_GRACE_MS to exit cleanly; if it doesn't, kill it but
+  // resolve as success (we have the reply).
+  const POST_TASK_GRACE_MS = 8000;
+
   return new Promise((resolve, reject) => {
     const child = spawn(binary, args, { windowsHide: true, shell: isWin });
     let stderr = '';
     let stdoutBuf = '';
     let killed = false;
+    let gotReplyText = false;
+    let postTaskTimer = null;
 
-    const timer = setTimeout(() => {
+    const hardTimer = setTimeout(() => {
       killed = true;
       child.kill('SIGKILL');
     }, opts.timeoutMs);
+
+    function armPostTaskGrace() {
+      if (postTaskTimer) return;
+      postTaskTimer = setTimeout(() => {
+        // Codex hung after replying — kill it but don't mark as killed
+        // (we have the agent_message text, treat as success).
+        try { child.kill('SIGKILL'); } catch { /* ignore */ }
+      }, POST_TASK_GRACE_MS);
+    }
 
     child.stdout.setEncoding('utf8');
     child.stdout.on('data', (chunk) => {
@@ -126,6 +145,9 @@ export function runCodex(opts) {
         stdoutBuf = stdoutBuf.slice(idx + 1);
         const ev = parseEventLine(line);
         if (ev) {
+          if (extractTextDelta(ev) || extractTaskComplete(ev)) {
+            if (!gotReplyText) { gotReplyText = true; armPostTaskGrace(); }
+          }
           try { opts.onEvent(ev); } catch { /* swallow handler errors */ }
         }
       }
@@ -135,17 +157,24 @@ export function runCodex(opts) {
     child.stderr.on('data', (chunk) => { stderr += chunk; });
 
     child.on('error', (err) => {
-      clearTimeout(timer);
+      clearTimeout(hardTimer);
+      if (postTaskTimer) clearTimeout(postTaskTimer);
       reject(err);
     });
 
     child.on('close', (exitCode, signal) => {
-      clearTimeout(timer);
+      clearTimeout(hardTimer);
+      if (postTaskTimer) clearTimeout(postTaskTimer);
       if (stdoutBuf.trim()) {
         const ev = parseEventLine(stdoutBuf);
         if (ev) { try { opts.onEvent(ev); } catch {} }
       }
-      resolve({ exitCode: killed ? -1 : exitCode, signal, stderr });
+      // If we killed the process AFTER receiving reply text (post-task grace),
+      // treat the exit as success — the reply is what matters.
+      const effectiveExitCode = (killed && !gotReplyText) ? -1
+                              : (gotReplyText && exitCode !== 0) ? 0
+                              : exitCode;
+      resolve({ exitCode: effectiveExitCode, signal, stderr });
     });
 
     child.stdin.setDefaultEncoding('utf8');

@@ -1,15 +1,39 @@
 import { join } from 'node:path';
 import { homedir } from 'node:os';
+import net from 'node:net';
 import { loadConfig } from './config.js';
 import { createLogger } from './log.js';
 import { createSessionStore } from './sessions.js';
 import { createQueue } from './queue.js';
 import { createBot } from './bot.js';
+import { createShimServer } from './chatCompletions.js';
 
 const CONFIG_PATH = process.env.OPENCLAW_CODEX_CONFIG
   || join(homedir(), '.openclaw-codex', 'config.json');
+const INSTANCE_LOCK = process.env.OPENCLAW_CODEX_LOCK || '\\\\.\\pipe\\openclaw-codex-bridge';
+
+async function acquireInstanceLock() {
+  const server = net.createServer();
+
+  return new Promise((resolve, reject) => {
+    server.once('error', (err) => {
+      if (err.code === 'EADDRINUSE') {
+        resolve(null);
+        return;
+      }
+      reject(err);
+    });
+    server.listen(INSTANCE_LOCK, () => resolve(server));
+  });
+}
 
 async function main() {
+  const instanceLock = await acquireInstanceLock();
+  if (!instanceLock) {
+    console.error('fatal: another openclaw-codex bridge instance is already running');
+    process.exit(0);
+  }
+
   const config = loadConfig(CONFIG_PATH);
   const log = createLogger({ dir: config.logging.dir });
   log.info('starting', {
@@ -53,6 +77,20 @@ async function main() {
   process.on('uncaughtException', (err) => {
     log.error('uncaughtException', { err: err.message, stack: err.stack });
   });
+
+  // Optional: OpenAI-style chat-completions HTTP shim (replaces clawdbot's
+  // legacy gateway:18789 so YESBEAT autoresponder etc. keep working).
+  let shim = null;
+  if (config.chatCompletionsShim?.enabled) {
+    shim = createShimServer({
+      bearerToken: config.chatCompletionsShim.bearerToken,
+      codexConfig: config.codex,
+      log
+    });
+    shim.listen(config.chatCompletionsShim.port, '127.0.0.1', () => {
+      log.info('chatCompletions shim listening', { port: config.chatCompletionsShim.port });
+    });
+  }
 
   log.info('starting polling for all bots');
   // Start each bot. grammy bot.start() resolves only when bot stops, so launch in parallel.

@@ -80,11 +80,20 @@ export function loadConfig(path) {
     maxQueuePerChat: parsed.telegram?.maxQueuePerChat ?? TELEGRAM_DEFAULTS.maxQueuePerChat
   };
 
+  const chatCompletionsShim = parsed.chatCompletionsShim
+    ? {
+        enabled: parsed.chatCompletionsShim.enabled !== false,
+        port: parsed.chatCompletionsShim.port ?? 18789,
+        bearerToken: parsed.chatCompletionsShim.bearerToken
+      }
+    : null;
+
   return {
     bots,
     telegram,
     codex: { ...DEFAULTS.codex, ...parsed.codex },
     logging: { ...DEFAULTS.logging, ...(parsed.logging || {}) },
-    proxy: { ...DEFAULTS.proxy, ...(parsed.proxy || {}) }
+    proxy: { ...DEFAULTS.proxy, ...(parsed.proxy || {}) },
+    chatCompletionsShim
   };
 }
