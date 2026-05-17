@@ -37,6 +37,23 @@ export function extractTaskComplete(ev) {
 }
 
 /**
+ * Returns a usage payload from a `turn.completed` event, or null if absent.
+ * Shape (codex 0.125): { input_tokens, cached_input_tokens, output_tokens, reasoning_output_tokens }.
+ */
+export function extractUsage(ev) {
+  if (!ev || typeof ev !== 'object') return null;
+  if (ev.type !== 'turn.completed' && ev.type !== 'turn_complete' && ev.type !== 'task_complete') return null;
+  const u = ev.usage;
+  if (!u || typeof u !== 'object') return null;
+  return {
+    input_tokens: Number(u.input_tokens) || 0,
+    cached_input_tokens: Number(u.cached_input_tokens) || 0,
+    output_tokens: Number(u.output_tokens) || 0,
+    reasoning_output_tokens: Number(u.reasoning_output_tokens) || 0
+  };
+}
+
+/**
  * Returns a short human-readable label for the current Codex activity, or null
  * if the event isn't a useful progress signal. Used to keep the user informed
  * during long turns where Codex 0.125 doesn't stream message deltas.
@@ -78,6 +95,9 @@ export function extractActivity(ev) {
  * @param {string} opts.prompt - user message (piped to stdin)
  * @param {number} opts.timeoutMs
  * @param {(ev:object)=>void} opts.onEvent
+ * @param {string} [opts.reasoningEffort] - low|medium|high. Sent as `-c model_reasoning_effort=...`.
+ * @param {boolean} [opts.ephemeral] - if true, pass `--ephemeral` (no rollout persistence).
+ * @param {(child:import('node:child_process').ChildProcess)=>void} [opts.onSpawn] - called once child is spawned.
  * @returns {Promise<{exitCode:number, signal:string|null, stderr:string}>}
  */
 export function runCodex(opts) {
@@ -99,11 +119,20 @@ export function runCodex(opts) {
   if (opts.images?.length) {
     for (const img of opts.images) imageArgs.push('-i', img);
   }
+  // Per-call config overrides via -c. Reasoning effort is a `gpt-5.5`-style knob
+  // (low|medium|high). Each -c flag takes one key=value pair.
+  const configArgs = [];
+  if (opts.reasoningEffort) {
+    configArgs.push('-c', `model_reasoning_effort=${opts.reasoningEffort}`);
+  }
+  // Ephemeral runs don't write rollout files — used for /btw (side questions
+  // that should not become part of the conversation history).
+  const ephemeralArgs = opts.ephemeral ? ['--ephemeral'] : [];
   const args = ['exec'];
   if (opts.sessionId) {
-    args.push('resume', '--json', '--full-auto', ...imageArgs, opts.sessionId, '-');
+    args.push('resume', '--json', '--full-auto', ...configArgs, ...ephemeralArgs, ...imageArgs, opts.sessionId, '-');
   } else {
-    args.push('--json', '--cd', opts.workspaceDir, '--full-auto', ...imageArgs, '-');
+    args.push('--json', '--cd', opts.workspaceDir, '--full-auto', ...configArgs, ...ephemeralArgs, ...imageArgs, '-');
   }
 
   // Codex 0.125 has a known bug where models_manager hangs after a successful
@@ -116,6 +145,9 @@ export function runCodex(opts) {
 
   return new Promise((resolve, reject) => {
     const child = spawn(binary, args, { windowsHide: true, shell: isWin });
+    if (typeof opts.onSpawn === 'function') {
+      try { opts.onSpawn(child); } catch { /* ignore */ }
+    }
     let stderr = '';
     let stdoutBuf = '';
     let killed = false;

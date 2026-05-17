@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { parseEventLine, extractTextDelta, extractSessionId, extractTaskComplete } from '../src/codex.js';
+import { parseEventLine, extractTextDelta, extractSessionId, extractTaskComplete, extractUsage } from '../src/codex.js';
 
 test('parseEventLine: returns parsed JSON for valid line', () => {
   const line = '{"type":"agent_message_delta","delta":"hello"}';
@@ -68,4 +68,45 @@ test('extractTaskComplete: returns true for codex 0.125 turn.completed', () => {
 
 test('extractTaskComplete: returns false for other types', () => {
   assert.equal(extractTaskComplete({ type: 'agent_message_delta' }), false);
+});
+
+test('extractUsage: returns normalized usage from turn.completed', () => {
+  const ev = {
+    type: 'turn.completed',
+    usage: { input_tokens: 23309, cached_input_tokens: 2432, output_tokens: 2, reasoning_output_tokens: 0 }
+  };
+  assert.deepEqual(extractUsage(ev), {
+    input_tokens: 23309,
+    cached_input_tokens: 2432,
+    output_tokens: 2,
+    reasoning_output_tokens: 0
+  });
+});
+
+test('extractUsage: returns null for non-turn events', () => {
+  assert.equal(extractUsage({ type: 'agent_message_delta', usage: { input_tokens: 1 } }), null);
+});
+
+test('extractUsage: returns null when usage is missing', () => {
+  assert.equal(extractUsage({ type: 'turn.completed' }), null);
+});
+
+test('extractUsage: coerces missing usage fields to 0', () => {
+  const ev = { type: 'turn.completed', usage: { input_tokens: 100 } };
+  assert.deepEqual(extractUsage(ev), {
+    input_tokens: 100,
+    cached_input_tokens: 0,
+    output_tokens: 0,
+    reasoning_output_tokens: 0
+  });
+});
+
+test('extractUsage: handles legacy task_complete shape', () => {
+  const ev = { type: 'task_complete', usage: { input_tokens: 50, output_tokens: 25 } };
+  assert.deepEqual(extractUsage(ev), {
+    input_tokens: 50,
+    cached_input_tokens: 0,
+    output_tokens: 25,
+    reasoning_output_tokens: 0
+  });
 });
